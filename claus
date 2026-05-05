@@ -56,16 +56,28 @@ file_mtime() {
 }
 
 # Extract the first meaningful user message from a session JSONL as its title.
+# Handles both string content and array-of-blocks content formats.
 # Skips <ide_selection> injected blocks and falls back to the session UUID.
 session_title_from_file() {
   local file="$1"
   local title
   title=$(grep -m5 '"type":"user"' "$file" 2>/dev/null | \
-    jq -r '(.message.content // []) |
-            map(select(.type=="text" and (.text | startswith("<ide_selection>") | not))) |
-            .[0].text // empty' 2>/dev/null | \
-    head -1 | tr '\n' ' ' | sed 's/[[:space:]]*$//' | cut -c1-72)
+    jq -r '
+      (.message.content) as $c |
+      if ($c | type) == "string" then
+        if ($c | startswith("<ide_selection>")) then empty else $c end
+      elif ($c | type) == "array" then
+        ($c | map(select(.type=="text" and (.text | startswith("<ide_selection>") | not))) | .[0].text // empty)
+      else empty end
+    ' 2>/dev/null | \
+    grep -v '^[[:space:]]*$' | head -1 | tr '\n' ' ' | sed 's/[[:space:]]*$//' | cut -c1-72)
   echo "${title:-$(basename "$file" .jsonl)}"
+}
+
+session_id_from_file() {
+  local file="$1"
+  grep -m1 '"type":"user"' "$file" 2>/dev/null | \
+    jq -r '.sessionId // empty' 2>/dev/null || basename "$file" .jsonl
 }
 
 # Read .cwd from the first user entry — this is the actual project working dir.
@@ -121,7 +133,7 @@ print_summary() {
     while IFS= read -r session_file; do
       [[ -z "$session_file" ]] && continue
 
-      local s_in s_out s_cache s_turns s_last s_title s_project
+      local s_in s_out s_cache s_turns s_last s_title s_project s_sid
       s_in=$(jq    -s --arg s "$session_file" \
                '[.[] | select(.session==$s) | .input_tokens]      | add // 0' "$CLAUS_LOG")
       s_out=$(jq   -s --arg s "$session_file" \
@@ -136,6 +148,10 @@ print_summary() {
                '[.[] | select(.session==$s)] | first | .title // empty'    "$CLAUS_LOG")
       s_project=$(jq -sr --arg s "$session_file" \
                '[.[] | select(.session==$s)] | first | .project // empty'  "$CLAUS_LOG")
+      s_sid=$(jq -sr --arg s "$session_file" \
+               '[.[] | select(.session==$s)] | first | .session_id // empty' "$CLAUS_LOG")
+      # fall back to basename if session_id not in log (older entries)
+      [[ -z "$s_sid" ]] && s_sid=$(basename "$session_file" .jsonl)
 
       local c_in c_out c_cache s_cost
       c_in=$(echo    "scale=4; $s_in    * 3    / 1000000" | bc)
@@ -144,15 +160,16 @@ print_summary() {
       s_cost=$(echo  "scale=4; $c_in + $c_out + $c_cache" | bc)
 
       echo "  ────────────────────────────────────────────────────────────"
-      printf "  project : %s\n" "${s_project:-(unknown)}"
-      printf "  title   : %s\n" "${s_title:-(no title)}"
-      printf "  turns   : %s | in: %s | out: %s | cache: %s | cost: \$%s\n" \
+      printf "  project    : %s\n" "${s_project:-(unknown)}"
+      printf "  session_id : %s\n" "${s_sid:-(unknown)}"
+      printf "  title      : %s\n" "${s_title:-(no title)}"
+      printf "  turns      : %s | in: %s | out: %s | cache: %s | cost: \$%s\n" \
         "$s_turns" \
         "$(format_number "$s_in")" \
         "$(format_number "$s_out")" \
         "$(format_number "$s_cache")" \
         "$s_cost"
-      [[ -n "$s_last" ]] && printf "  last    : %s\n" "$s_last"
+      [[ -n "$s_last" ]] && printf "  last       : %s\n" "$s_last"
     done <<< "$sessions"
     echo "  ────────────────────────────────────────────────────────────"
   fi
@@ -240,14 +257,17 @@ watch_sessions() {
     [[ "$type" != "assistant" ]] && continue
 
     if [[ -z "${session_meta[$current_file]:-}" ]]; then
-      local _proj _title
+      local _proj _title _sid
       _proj=$(project_from_file "$current_file")
       _title=$(session_title_from_file "$current_file")
-      session_meta[$current_file]="${_proj}|${_title}"
+      _sid=$(session_id_from_file "$current_file")
+      session_meta[$current_file]="${_proj}|${_title}|${_sid}"
     fi
-    local s_project s_title
+    local s_project s_title s_sid _rest
     s_project="${session_meta[$current_file]%%|*}"
-    s_title="${session_meta[$current_file]#*|}"
+    _rest="${session_meta[$current_file]#*|}"
+    s_title="${_rest%%|*}"
+    s_sid="${_rest##*|}"
 
     local in_tok out_tok cache_r cache_w ts
     in_tok=$(printf '%s' "$line"  | jq -r '.message.usage.input_tokens                    // 0')
@@ -266,6 +286,7 @@ watch_sessions() {
     jq -nc \
       --arg  ts      "$ts"           \
       --arg  session "$current_file" \
+      --arg  sid     "$s_sid"        \
       --arg  project "$s_project"    \
       --arg  title   "$s_title"      \
       --argjson in   "$in_tok"       \
@@ -273,7 +294,7 @@ watch_sessions() {
       --argjson cr   "$cache_r"      \
       --argjson cw   "$cache_w"      \
       --argjson turn "$turn"         \
-      '{timestamp:$ts, turn:$turn, session:$session, project:$project, title:$title,
+      '{timestamp:$ts, turn:$turn, session:$session, session_id:$sid, project:$project, title:$title,
         input_tokens:$in, output_tokens:$out, cache_read_tokens:$cr, cache_write_tokens:$cw}' \
       >> "$CLAUS_LOG"
 
