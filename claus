@@ -1,0 +1,306 @@
+#!/usr/bin/env bash
+# claus — passive Claude Code usage tracker
+# https://github.com/YOURNAME/claus
+# Version: 0.3.0
+
+set -euo pipefail
+
+VERSION="0.3.0"
+LOG_DIR="${CLAUS_LOG_DIR:-$HOME/.claude/projects}"
+CLAUS_LOG="${CLAUS_OUTPUT_LOG:-$HOME/.claus/usage.jsonl}"
+CLAUS_LOG_DIR="$(dirname "$CLAUS_LOG")"
+
+# ── helpers ────────────────────────────────────────────────────────────────────
+
+usage() {
+  cat <<EOF
+claus v$VERSION — passive Claude Code usage tracker
+
+Usage:
+  claus              Watch all active sessions (default)
+  claus summary      Print totals from stored log
+  claus --version    Show version
+  claus --help       Show this help
+
+Environment:
+  CLAUS_LOG_DIR      Override Claude project logs path (default: ~/.claude/projects)
+  CLAUS_OUTPUT_LOG   Override claus output log path   (default: ~/.claus/usage.jsonl)
+EOF
+}
+
+check_deps() {
+  local missing=()
+  for dep in jq tail find bc; do
+    command -v "$dep" &>/dev/null || missing+=("$dep")
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "claus: missing dependencies: ${missing[*]}"
+    echo "  Install with: brew install ${missing[*]}   # macOS"
+    echo "             or: apt install ${missing[*]}   # Debian/Ubuntu"
+    exit 1
+  fi
+}
+
+ensure_log_dir() {
+  mkdir -p "$CLAUS_LOG_DIR"
+}
+
+format_number() {
+  printf "%'d" "$1" 2>/dev/null || echo "$1"
+}
+
+file_mtime() {
+  stat -c "%y" "$1" 2>/dev/null | cut -d'.' -f1 || \
+  date -r "$1" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || \
+  echo "unknown"
+}
+
+# Extract the first meaningful user message from a session JSONL as its title.
+# Skips <ide_selection> injected blocks and falls back to the session UUID.
+session_title_from_file() {
+  local file="$1"
+  local title
+  title=$(grep -m5 '"type":"user"' "$file" 2>/dev/null | \
+    jq -r '(.message.content // []) |
+            map(select(.type=="text" and (.text | startswith("<ide_selection>") | not))) |
+            .[0].text // empty' 2>/dev/null | \
+    head -1 | tr '\n' ' ' | sed 's/[[:space:]]*$//' | cut -c1-72)
+  echo "${title:-$(basename "$file" .jsonl)}"
+}
+
+# Read .cwd from the first user entry — this is the actual project working dir.
+project_from_file() {
+  local file="$1"
+  grep -m1 '"type":"user"' "$file" 2>/dev/null | \
+    jq -r '.cwd // empty' 2>/dev/null || true
+}
+
+# ── summary command ─────────────────────────────────────────────────────────────
+
+print_summary() {
+  if [[ ! -f "$CLAUS_LOG" ]]; then
+    echo "claus: no usage log found at $CLAUS_LOG"
+    echo "       run 'claus' during a session to start collecting data"
+    exit 0
+  fi
+
+  local last_updated
+  last_updated=$(file_mtime "$CLAUS_LOG")
+
+  local total_in total_out total_cache turns
+  total_in=$(jq  -s '[.[].input_tokens]      | add // 0' "$CLAUS_LOG")
+  total_out=$(jq -s '[.[].output_tokens]     | add // 0' "$CLAUS_LOG")
+  total_cache=$(jq -s '[.[].cache_read_tokens] | add // 0' "$CLAUS_LOG")
+  turns=$(jq -s 'length' "$CLAUS_LOG")
+
+  local cost_in cost_out cost_cache total_cost
+  cost_in=$(echo    "scale=4; $total_in    * 3    / 1000000" | bc)
+  cost_out=$(echo   "scale=4; $total_out   * 15   / 1000000" | bc)
+  cost_cache=$(echo "scale=4; $total_cache * 0.30 / 1000000" | bc)
+  total_cost=$(echo "scale=4; $cost_in + $cost_out + $cost_cache" | bc)
+
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  claus usage summary"
+  printf "  Last updated   : %s\n" "$last_updated"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  printf "  Turns logged   : %s\n" "$turns"
+  printf "  Input tokens   : %s\n" "$(format_number "$total_in")"
+  printf "  Output tokens  : %s\n" "$(format_number "$total_out")"
+  printf "  Cache hits     : %s\n" "$(format_number "$total_cache")"
+  printf "  Est. cost      : \$%s\n" "$total_cost"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+  # Per-session breakdown
+  local sessions
+  sessions=$(jq -r '.session // empty' "$CLAUS_LOG" 2>/dev/null | sort -u)
+
+  if [[ -n "$sessions" ]]; then
+    echo ""
+    echo "  Sessions:"
+    while IFS= read -r session_file; do
+      [[ -z "$session_file" ]] && continue
+
+      local s_in s_out s_cache s_turns s_last s_title s_project
+      s_in=$(jq    -s --arg s "$session_file" \
+               '[.[] | select(.session==$s) | .input_tokens]      | add // 0' "$CLAUS_LOG")
+      s_out=$(jq   -s --arg s "$session_file" \
+               '[.[] | select(.session==$s) | .output_tokens]     | add // 0' "$CLAUS_LOG")
+      s_cache=$(jq -s --arg s "$session_file" \
+               '[.[] | select(.session==$s) | .cache_read_tokens]  | add // 0' "$CLAUS_LOG")
+      s_turns=$(jq -s --arg s "$session_file" \
+               '[.[] | select(.session==$s)] | length'              "$CLAUS_LOG")
+      s_last=$(jq  -sr --arg s "$session_file" \
+               '[.[] | select(.session==$s)] | last | .timestamp // empty' "$CLAUS_LOG")
+      s_title=$(jq -sr --arg s "$session_file" \
+               '[.[] | select(.session==$s)] | first | .title // empty'    "$CLAUS_LOG")
+      s_project=$(jq -sr --arg s "$session_file" \
+               '[.[] | select(.session==$s)] | first | .project // empty'  "$CLAUS_LOG")
+
+      local c_in c_out c_cache s_cost
+      c_in=$(echo    "scale=4; $s_in    * 3    / 1000000" | bc)
+      c_out=$(echo   "scale=4; $s_out   * 15   / 1000000" | bc)
+      c_cache=$(echo "scale=4; $s_cache * 0.30 / 1000000" | bc)
+      s_cost=$(echo  "scale=4; $c_in + $c_out + $c_cache" | bc)
+
+      echo "  ────────────────────────────────────────────────────────────"
+      printf "  project : %s\n" "${s_project:-(unknown)}"
+      printf "  title   : %s\n" "${s_title:-(no title)}"
+      printf "  turns   : %s | in: %s | out: %s | cache: %s | cost: \$%s\n" \
+        "$s_turns" \
+        "$(format_number "$s_in")" \
+        "$(format_number "$s_out")" \
+        "$(format_number "$s_cache")" \
+        "$s_cost"
+      [[ -n "$s_last" ]] && printf "  last    : %s\n" "$s_last"
+    done <<< "$sessions"
+    echo "  ────────────────────────────────────────────────────────────"
+  fi
+
+  echo "  Log: $CLAUS_LOG"
+  echo ""
+}
+
+# ── watcher ─────────────────────────────────────────────────────────────────────
+
+watch_sessions() {
+  mapfile -t initial_files < <(find "$LOG_DIR" -name "*.jsonl" 2>/dev/null)
+
+  echo "claus v$VERSION — watching $LOG_DIR"
+  if [[ ${#initial_files[@]} -gt 0 ]]; then
+    echo "  found ${#initial_files[@]} existing session file(s)"
+  else
+    echo "  no sessions yet — will detect new ones automatically"
+  fi
+  echo "  log  → $CLAUS_LOG"
+  echo "  ctrl+c to stop and print summary"
+  echo ""
+
+  # FIFO-based event bus: each tail process writes "filepath<TAB>line" lines.
+  # exec 3<>"$fifo" opens read/write (non-blocking) to anchor the FIFO open so
+  # the reader (fd 4) never sees EOF while any session is active.
+  local fifo known_tmp
+  fifo=$(mktemp -u -t claus_fifo_XXXXXX)
+  known_tmp=$(mktemp -t claus_known_XXXXXX)
+  mkfifo "$fifo"
+  exec 3<>"$fifo"
+  exec 4<"$fifo"
+
+  # Start a dedicated tail for one file; writes prefixed lines to the FIFO.
+  start_tail() {
+    local f="$1"
+    ( tail -F -n 0 "$f" 2>/dev/null | \
+      while IFS= read -r raw; do
+        printf '%s\t%s\n' "$f" "$raw" >&3
+      done ) &
+  }
+
+  # Seed known-files registry and tail each pre-existing session.
+  for f in "${initial_files[@]}"; do
+    echo "$f" >> "$known_tmp"
+    start_tail "$f"
+  done
+
+  # Background poller: every 2 s look for new .jsonl files and tail them.
+  (
+    while true; do
+      sleep 2
+      while IFS= read -r f; do
+        if ! grep -qxF "$f" "$known_tmp" 2>/dev/null; then
+          echo "$f" >> "$known_tmp"
+          printf '[claus] new session: %s\n' "$(basename "$f" .jsonl)" >&2
+          start_tail "$f"
+        fi
+      done < <(find "$LOG_DIR" -name "*.jsonl" 2>/dev/null)
+    done
+  ) &
+  local poller_pid=$!
+
+  local prev_in=0 turn=0 current_file=""
+  declare -A session_meta=()
+
+  cleanup() {
+    trap - INT TERM
+    kill "$poller_pid" 2>/dev/null || true
+    jobs -p | xargs -r kill 2>/dev/null || true
+    exec 3>&- 2>/dev/null || true
+    exec 4>&- 2>/dev/null || true
+    rm -f "$fifo" "$known_tmp"
+    echo ""
+    print_summary
+  }
+  trap cleanup INT TERM
+
+  # Main event loop: each line is "filepath<TAB>json-line".
+  while IFS=$'\t' read -r current_file line <&4; do
+    [[ "$line" != "{"* ]] && continue
+
+    local type
+    type=$(printf '%s' "$line" | jq -r '.type // empty' 2>/dev/null) || continue
+    [[ "$type" != "assistant" ]] && continue
+
+    if [[ -z "${session_meta[$current_file]:-}" ]]; then
+      local _proj _title
+      _proj=$(project_from_file "$current_file")
+      _title=$(session_title_from_file "$current_file")
+      session_meta[$current_file]="${_proj}|${_title}"
+    fi
+    local s_project s_title
+    s_project="${session_meta[$current_file]%%|*}"
+    s_title="${session_meta[$current_file]#*|}"
+
+    local in_tok out_tok cache_r cache_w ts
+    in_tok=$(printf '%s' "$line"  | jq -r '.message.usage.input_tokens                    // 0')
+    out_tok=$(printf '%s' "$line" | jq -r '.message.usage.output_tokens                   // 0')
+    cache_r=$(printf '%s' "$line" | jq -r '.message.usage.cache_read_input_tokens         // 0')
+    cache_w=$(printf '%s' "$line" | jq -r '.message.usage.cache_creation_input_tokens     // 0')
+    ts=$(printf '%s' "$line"      | jq -r '.timestamp // empty')
+
+    local ctx_delta=0
+    if [[ $prev_in -gt 0 && $in_tok -gt $prev_in ]]; then
+      ctx_delta=$(echo "scale=0; ($in_tok - $prev_in) * 100 / $prev_in" | bc)
+    fi
+    prev_in=$in_tok
+    turn=$((turn + 1))
+
+    jq -nc \
+      --arg  ts      "$ts"           \
+      --arg  session "$current_file" \
+      --arg  project "$s_project"    \
+      --arg  title   "$s_title"      \
+      --argjson in   "$in_tok"       \
+      --argjson out  "$out_tok"      \
+      --argjson cr   "$cache_r"      \
+      --argjson cw   "$cache_w"      \
+      --argjson turn "$turn"         \
+      '{timestamp:$ts, turn:$turn, session:$session, project:$project, title:$title,
+        input_tokens:$in, output_tokens:$out, cache_read_tokens:$cr, cache_write_tokens:$cw}' \
+      >> "$CLAUS_LOG"
+
+    local ctx_str="" cache_str=""
+    [[ $ctx_delta -gt 0 ]] && ctx_str=" | ctx: +${ctx_delta}%"
+    [[ $cache_r   -gt 0 ]] && cache_str=" | cache: $(format_number "$cache_r")"
+
+    printf "[claus] turn %-3s | in: %-7s | out: %-6s%s%s\n" \
+      "$turn" \
+      "$(format_number "$in_tok")" \
+      "$(format_number "$out_tok")" \
+      "$cache_str" \
+      "$ctx_str"
+
+  done
+
+  cleanup
+}
+
+# ── entry point ──────────────────────────────────────────────────────────────────
+
+check_deps
+ensure_log_dir
+
+case "${1:-watch}" in
+  summary)         print_summary ;;
+  --version|-v)    echo "claus v$VERSION" ;;
+  --help|-h)       usage ;;
+  watch|*)         watch_sessions ;;
+esac
